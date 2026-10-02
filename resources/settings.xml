@@ -1,0 +1,39 @@
+<?xml version="1.0" encoding="utf-8" standalone="yes"?>
+<settings version="1">
+    <section id="plugin.video.filma24">
+        <category id="general" label="General">
+            <group id="1" label="Network &amp; Domain Settings">
+                <setting id="base_url" type="string" label="Base Domain URL" help="Base domain URL for the streaming website. Change if the site moves to a new mirror.">
+                    <level>0</level>
+                    <default>https://filma24.stream</default>
+                    <control type="edit" format="string" />
+                </setting>
+                <setting id="user_agent" type="string" label="Desktop User-Agent" help="Spoofed browser User-Agent header for HTTP requests.">
+                    <level>0</level>
+                    <default>Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36</default>
+                    <control type="edit" format="string" />
+                </setting>
+                <setting id="timeout" type="integer" label="Request Timeout (seconds)" help="Maximum seconds to wait for network responses before aborting.">
+                    <level>0</level>
+                    <default>15</default>
+                    <control type="slider" format="integer" range="5,5,60" />
+                </setting>
+                <setting id="ssl_verify" type="boolean" label="Verify SSL Certificates" help="Disable if encountering SSL certificate or handshake errors on mirror domains.">
+                    <level>0</level>
+                    <default>false</default>
+                    <control type="toggle" />
+                </setting>
+                <setting id="use_doh" type="boolean" label="Bypass ISP DNS Blocking (DoH)" help="Automatically bypasses ISP-level DNS blocks and redirects using Google DNS-over-HTTPS.">
+                    <level>0</level>
+                    <default>true</default>
+                    <control type="toggle" />
+                </setting>
+                <setting id="auto_select_server" type="boolean" label="Auto-select First Working Server" help="Automatically resolves and plays the first working stream without showing the server selection dialog.">
+                    <level>0</level>
+                    <default>false</default>
+                    <control type="toggle" />
+                </setting>
+            </group>
+        </category>
+    </section>
+</settings>

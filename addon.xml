@@ -1,0 +1,33 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<addon id="plugin.video.filma24" name="Filma24" version="1.0.0" provider-name="Dev">
+    <requires>
+        <!-- Kodi 20 (Nexus) & Kodi 21 (Omega) Python 3 Runtime -->
+        <import addon="xbmc.python" version="3.0.0"/>
+        <!-- Network HTTP client library -->
+        <import addon="script.module.requests" version="2.25.1"/>
+        <!-- HTML parsing library -->
+        <import addon="script.module.beautifulsoup4" version="4.9.3"/>
+        <!-- Video hoster resolver library (optional flag prevents hard installation blocking if repository is not yet added) -->
+        <import addon="script.module.resolveurl" version="5.1.0" optional="true"/>
+    </requires>
+
+    <!-- Plugin Entry Point -->
+    <extension point="xbmc.python.pluginsource" library="addon.py">
+        <provides>video</provides>
+    </extension>
+
+    <!-- Plugin Metadata -->
+    <extension point="xbmc.addon.metadata">
+        <summary lang="en">Filma24 Video Add-on</summary>
+        <summary lang="sq">Shtojca e videove Filma24</summary>
+        <description lang="en">Watch movies and series from filma24.stream directly inside Kodi.</description>
+        <description lang="sq">Shikoni filma dhe seriale nga filma24.stream drejtpërdrejt në Kodi.</description>
+        <disclaimer lang="en">This add-on does not host or store any media. It merely indexes and resolves links available on the public internet.</disclaimer>
+        <platform>all</platform>
+        <license>GPL-3.0-or-later</license>
+        <assets>
+            <icon>resources/icon.png</icon>
+            <fanart>resources/fanart.jpg</fanart>
+        </assets>
+    </extension>
+</addon>
