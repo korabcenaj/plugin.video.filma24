@@ -1,12 +1,12 @@
 <?xml version="1.0" encoding="UTF-8" standalone="yes"?>
-<addon id="plugin.video.filma24" name="Filma24" version="1.0.0" provider-name="Dev">
+<addon id="plugin.video.filma24" name="Filma24" version="1.0.2" provider-name="Dev">
     <requires>
         <!-- Kodi 20 (Nexus) & Kodi 21 (Omega) Python 3 Runtime -->
         <import addon="xbmc.python" version="3.0.0"/>
         <!-- Network HTTP client library -->
         <import addon="script.module.requests" version="2.25.1"/>
-        <!-- HTML parsing library -->
-        <import addon="script.module.beautifulsoup4" version="4.9.3"/>
+        <!-- HTML parsing library (optional, addon uses zero-dependency regex engine) -->
+        <import addon="script.module.beautifulsoup4" version="4.9.3" optional="true"/>
         <!-- Video hoster resolver library (optional flag prevents hard installation blocking if repository is not yet added) -->
         <import addon="script.module.resolveurl" version="5.1.0" optional="true"/>
     </requires>

@@ -7,22 +7,19 @@ Helper script to package the add-on into a valid Kodi installable ZIP file.
 import os
 import zipfile
 
+import re
+
 ADDON_ID = "plugin.video.filma24"
-VERSION = "1.0.0"
+
+def get_addon_version():
+    with open("addon.xml", "r", encoding="utf-8") as f:
+        m = re.search(r'id=["\']plugin\.video\.filma24["\'][^>]+version=["\']([^"\']+)["\']', f.read())
+        return m.group(1) if m else "1.0.0"
+
+VERSION = get_addon_version()
 OUTPUT_ZIP = f"{ADDON_ID}-{VERSION}.zip"
 
-# Files and directories to include in package
-INCLUDE_PATTERNS = [
-    "addon.xml",
-    "addon.py",
-    "resources/settings.xml",
-    "resources/icon.png",
-    "resources/fanart.jpg",
-    "resources/lib/__init__.py",
-    "resources/lib/scraper.py",
-]
-
-EXCLUDE_EXTS = (".pyc", ".pyo", ".DS_Store", ".git")
+EXCLUDE_EXTS = (".pyc", ".pyo", ".DS_Store", ".git", ".zip", ".html")
 
 
 def build_addon_zip():

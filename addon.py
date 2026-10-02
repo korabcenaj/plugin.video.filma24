@@ -1,61 +1,151 @@
+import sys
+import os
+import xbmc
+
+
+def _trace(msg):
+    try:
+        with open('/tmp/filma24_trace.log', 'a') as f:
+            f.write(f"[{os.getpid()}] {msg}\n")
+            f.flush()
+            os.fsync(f.fileno())
+    except Exception:
+        pass
+
+
+def disable_core_dumps():
+    """Prevents large core dumps from filling webOS flash storage on unexpected exits."""
+    try:
+        import ctypes
+
+        class RLimit(ctypes.Structure):
+            _fields_ = [('rlim_cur', ctypes.c_ulonglong), ('rlim_max', ctypes.c_ulonglong)]
+
+        libc = ctypes.CDLL('libc.so.6')
+        r = RLimit(0, 0)
+        libc.setrlimit(4, ctypes.byref(r))  # RLIMIT_CORE = 4 on Linux
+    except Exception:
+        pass
+
+
+def release_memory():
+    """Forces Python garbage collection and releases glibc arena heap to the OS."""
+    try:
+        import gc
+        gc.collect()
+        import ctypes
+        libc = ctypes.CDLL('libc.so.6')
+        libc.malloc_trim(0)
+    except Exception:
+        pass
+
+
+disable_core_dumps()
+release_memory()
+
 import concurrent.futures
+_trace("imported concurrent.futures")
 import html
 import json
-import os
 import re
-import socket
-import sys
 import urllib.parse
+_trace("imported basic modules")
 import urllib3
-from bs4 import BeautifulSoup
+_trace("imported urllib3")
+from urllib3.connection import HTTPConnection, HTTPSConnection
+from urllib3.connectionpool import HTTPConnectionPool, HTTPSConnectionPool
+from urllib3.poolmanager import PoolManager
+_trace("imported urllib3 components")
 import requests
-import xbmc
+_trace("imported requests")
 import xbmcaddon
 import xbmcgui
 import xbmcplugin
 import xbmcvfs
+_trace("imported xbmc modules")
 
 # Suppress insecure SSL warnings
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 # Addon metadata & handle setup
-ADDON = xbmcaddon.Addon()
+ADDON = xbmcaddon.Addon('plugin.video.filma24')
 ADDON_ID = ADDON.getAddonInfo('id')
 ADDON_NAME = ADDON.getAddonInfo('name')
 
-# Dynamic DNS-over-HTTPS bypass
-_ORIG_GETADDRINFO = socket.getaddrinfo
-_DOH_CACHE = {}
+# Verified working Cloudflare Anycast edge IP for filma24.stream (bypasses ISP DNS blockade)
+_DOH_IP = '188.114.97.7'
 
 
-def _resolve_doh_ip(domain: str) -> str:
-    """Dynamically resolves real IP using Google DoH to bypass ISP DNS blockades."""
-    if domain in _DOH_CACHE:
-        return _DOH_CACHE[domain]
-    try:
-        resp = requests.get(f"https://dns.google/resolve?name={domain}&type=A", timeout=3)
-        if resp.status_code == 200:
-            for ans in resp.json().get('Answer', []):
-                if ans.get('type') == 1:
-                    ip = ans.get('data')
-                    _DOH_CACHE[domain] = ip
-                    return ip
-    except Exception:
-        pass
-    fallback_ip = '188.114.97.7'
-    _DOH_CACHE[domain] = fallback_ip
-    return fallback_ip
+class CustomHTTPSConnection(HTTPSConnection):
+    def _new_conn(self):
+        extra_kw = {}
+        if self.source_address:
+            extra_kw['source_address'] = self.source_address
+        if self.socket_options:
+            extra_kw['socket_options'] = self.socket_options
+
+        target_host = self.host
+        try:
+            base_netloc = urllib.parse.urlparse(get_base_url()).netloc
+        except Exception:
+            base_netloc = 'filma24.stream'
+
+        if target_host in ('filma24.stream', 'www.filma24.stream', base_netloc):
+            target_host = _DOH_IP
+
+        return urllib3.util.connection.create_connection(
+            (target_host, self.port), self.timeout, **extra_kw
+        )
 
 
-def _custom_getaddrinfo(host, port, family=0, type=0, proto=0, flags=0):
-    use_doh = ADDON.getSetting('use_doh').lower() != 'false'
-    if use_doh and host in ('filma24.stream', 'www.filma24.stream'):
-        ip = _resolve_doh_ip(host)
-        return _ORIG_GETADDRINFO(ip, port, family, type, proto, flags)
-    return _ORIG_GETADDRINFO(host, port, family, type, proto, flags)
+class CustomHTTPConnection(HTTPConnection):
+    def _new_conn(self):
+        extra_kw = {}
+        if self.source_address:
+            extra_kw['source_address'] = self.source_address
+        if self.socket_options:
+            extra_kw['socket_options'] = self.socket_options
+
+        target_host = self.host
+        try:
+            base_netloc = urllib.parse.urlparse(get_base_url()).netloc
+        except Exception:
+            base_netloc = 'filma24.stream'
+
+        if target_host in ('filma24.stream', 'www.filma24.stream', base_netloc):
+            target_host = _DOH_IP
+
+        return urllib3.util.connection.create_connection(
+            (target_host, self.port), self.timeout, **extra_kw
+        )
 
 
-socket.getaddrinfo = _custom_getaddrinfo
+class CustomHTTPSConnectionPool(HTTPSConnectionPool):
+    ConnectionCls = CustomHTTPSConnection
+
+
+class CustomHTTPConnectionPool(HTTPConnectionPool):
+    ConnectionCls = CustomHTTPConnection
+
+
+class CustomPoolManager(PoolManager):
+    def _new_pool(self, scheme, host, port, request_context=None):
+        if scheme == 'https':
+            return CustomHTTPSConnectionPool(host, port, **self.connection_pool_kw)
+        elif scheme == 'http':
+            return CustomHTTPConnectionPool(host, port, **self.connection_pool_kw)
+        return super()._new_pool(scheme, host, port, request_context=request_context)
+
+
+class CustomDNSAdapter(requests.adapters.HTTPAdapter):
+    """Requests HTTPAdapter that routes filma24 domains to the bypass edge IP while preserving SNI."""
+    def init_poolmanager(self, connections, maxsize, block=False, **pool_kwargs):
+        self.poolmanager = CustomPoolManager(
+            num_pools=connections,
+            maxsize=maxsize,
+            block=block,
+            **pool_kwargs
+        )
 
 # Arguments passed by Kodi runtime:
 # sys.argv[0] -> Base plugin URL (e.g. 'plugin://plugin.video.filma24/')
@@ -89,7 +179,8 @@ HOST_DOMAINS = [
     'supervideo',
     'wolfstream',
     'lulustream',
-    'filma.live'
+    'filma.live',
+    'eugenemakedraw'
 ]
 
 
@@ -131,6 +222,14 @@ def get_ssl_verify() -> bool:
 def get_auto_select_server() -> bool:
     """Retrieve auto server selection setting."""
     return ADDON.getSetting('auto_select_server').lower() == 'true'
+
+
+def get_doh_enabled() -> bool:
+    """Retrieve DNS-over-HTTPS / ISP bypass setting."""
+    try:
+        return ADDON.getSetting('use_doh').lower() != 'false'
+    except Exception:
+        return True
 
 
 def get_search_history() -> list:
@@ -198,6 +297,10 @@ def get_http_session() -> requests.Session:
     """Create requests Session pre-configured with browser headers, referer, and SSL setting."""
     base_domain = get_base_url()
     session = requests.Session()
+    if get_doh_enabled():
+        adapter = CustomDNSAdapter()
+        session.mount('https://', adapter)
+        session.mount('http://', adapter)
     session.verify = get_ssl_verify()
     session.headers.update({
         'User-Agent': get_user_agent(),
@@ -246,11 +349,17 @@ def apply_video_metadata(list_item: xbmcgui.ListItem, info: dict):
                 except Exception:
                     pass
             if 'genres' in info and hasattr(tag, 'setGenres') and info['genres']:
-                tag.setGenres(info['genres'])
+                try:
+                    tag.setGenres(list(info['genres']))
+                except Exception:
+                    pass
             return
         except Exception:
             pass
-    list_item.setInfo('video', info)
+    try:
+        list_item.setInfo('video', info)
+    except Exception:
+        pass
 
 
 def root_menu():
@@ -341,6 +450,109 @@ def categories():
     xbmcplugin.endOfDirectory(HANDLE)
 
 
+def extract_movie_cards(html_content: str, base_url: str) -> list:
+    """Ultra-fast regex-based card scraper that requires 0 dependencies and minimal memory."""
+    cards = []
+    card_pattern = re.compile(
+        r'''(<(?:div|article)[^>]*class=[\"'][^\"']*(?:movie-thumb|item-movies|post|item)[^\"']*[\"'].*?)'''
+        r'''(?=(?:<(?:div|article)[^>]*class=[\"'](?:movie-thumb|item-movies|post|item)|\Z))''',
+        re.DOTALL | re.IGNORECASE
+    )
+    blocks = card_pattern.findall(html_content)
+    if not blocks:
+        blocks = re.findall(r'<article[^>]*>.*?</article>', html_content, re.DOTALL | re.IGNORECASE)
+
+    seen_urls = set()
+    for block in blocks:
+        link_m = re.search(r'''<a[^>]+href=[\"']([^\"']+)[\"'][^>]+title=[\"']([^\"']+)[\"']''', block)
+        if not link_m:
+            link_m = re.search(r'''<a[^>]+title=[\"']([^\"']+)[\"'][^>]+href=[\"']([^\"']+)[\"']''', block)
+        if not link_m:
+            link_m = re.search(r'''<a[^>]+href=[\"']([^\"']+)[\"']''', block)
+            if not link_m:
+                continue
+            item_url = link_m.group(1).strip()
+            raw_title = 'Pa Titull'
+        else:
+            if 'title=' in link_m.group(0)[:link_m.group(0).find('href=')]:
+                raw_title = html.unescape(link_m.group(1).strip())
+                item_url = link_m.group(2).strip()
+            else:
+                item_url = link_m.group(1).strip()
+                raw_title = html.unescape(link_m.group(2).strip())
+
+        if not item_url or item_url.startswith('#') or item_url.startswith('javascript:'):
+            continue
+        if any(skip in item_url.lower() for skip in ['/zbulo', '/kategori', '/dmca', '/privacy', '/contact']):
+            continue
+
+        full_url = urllib.parse.urljoin(base_url, item_url)
+        if full_url in seen_urls:
+            continue
+        seen_urls.add(full_url)
+
+        title_h = re.search(r'''<(?:h4|h3|h2)[^>]*class=[\"']?[^\"'>]*?(?:post-title|title)?[^\"'>]*?>\s*(?:<a[^>]*>)?([^<]+)''', block, re.IGNORECASE)
+        if title_h and title_h.group(1).strip() and not title_h.group(1).strip().isdigit():
+            raw_title = html.unescape(title_h.group(1).strip())
+
+        img_m = re.search(r'''<img[^>]+?\bsrc=[\"'](https?://[^\"']+)[\"']''', block)
+        if not img_m:
+            img_m = re.search(r'''<img[^>]+?(?:data-src|data-lazy-src)=[\"'](https?://[^\"']+)[\"']''', block)
+        thumb_url = img_m.group(1).strip() if img_m else ''
+
+        q_m = re.search(r'''class=[\"'](?:quality-poster|quality|featu|hd)[\"'][^>]*>([^<]+)<''', block, re.IGNORECASE)
+        quality_badge = q_m.group(1).strip() if q_m else ''
+
+        r_m = re.search(r'''class=[\"'](?:imdb-poster|imdb|rating)[\"'][^>]*>([^<]+)<''', block, re.IGNORECASE)
+        rating_val = None
+        if r_m:
+            num_m = re.search(r'(\d+(?:\.\d+)?)', r_m.group(1))
+            if num_m:
+                try:
+                    rating_val = float(num_m.group(1))
+                except ValueError:
+                    pass
+
+        y_m = re.search(r'\b(19\d\d|20\d\d)\b', block)
+        year_val = int(y_m.group(1)) if y_m else None
+
+        p_m = re.search(r'''<p[^>]*class=[\"'](?:f-desc|texto|plot)[\"'][^>]*>(.*?)</p>''', block, re.DOTALL | re.IGNORECASE)
+        plot_text = html.unescape(re.sub(r'<[^>]+>', '', p_m.group(1)).strip()) if p_m else ''
+
+        genres_m = re.findall(r'''<a[^>]+class=[\"'](?:text-dark|genre)[\"'][^>]*>([^<]+)</a>''', block)
+        if not genres_m:
+            genres_m = re.findall(r'''<span class=[\"']m-card-genre[\"']>([^<]+)</span>''', block)
+        genres = [html.unescape(g.strip()) for g in genres_m if g.strip()]
+
+        cards.append({
+            'title': raw_title,
+            'url': full_url,
+            'thumb': thumb_url,
+            'quality': quality_badge,
+            'rating': rating_val,
+            'year': year_val,
+            'plot': plot_text,
+            'genres': genres
+        })
+    return cards
+
+
+def extract_next_page(html_content: str, current_page: int, base_url: str) -> str:
+    """Finds next page link from pagination markup."""
+    next_m = re.search(r'''<a[^>]+class=[\"']([^\"']*nextpostslink[^\"']*)[\"'][^>]+href=[\"']([^\"']+)[\"']''', html_content, re.IGNORECASE)
+    if not next_m:
+        next_m = re.search(r'''<a[^>]+href=[\"']([^\"']+)[\"'][^>]+class=[\"']([^\"']*nextpostslink[^\"']*)[\"']''', html_content, re.IGNORECASE)
+        if next_m:
+            return urllib.parse.urljoin(base_url, next_m.group(1).strip())
+    else:
+        return urllib.parse.urljoin(base_url, next_m.group(2).strip())
+    if not next_m:
+        next_m = re.search(r'''<a[^>]+href=[\"']([^\"']+)[\"'][^>]*>\s*''' + str(current_page + 1) + r'''\s*<''', html_content)
+        if next_m:
+            return urllib.parse.urljoin(base_url, next_m.group(1).strip())
+    return ''
+
+
 def list_movies(url: str, page: str, content_type: str, query: str = ''):
     """
     Fetches catalog pages, extracts movie cards via multi-selector parsing,
@@ -358,11 +570,6 @@ def list_movies(url: str, page: str, content_type: str, query: str = ''):
                 url = f"{base_domain}/seriale"
             category_label = f"Seriale (Faqja {page_num})"
         elif content_type == 'search':
-            safe_query = urllib.parse.quote_plus(query)
-            if page_num > 1:
-                url = f"{base_domain}/page/{page_num}/?s={safe_query}"
-            else:
-                url = f"{base_domain}/?s={safe_query}"
             category_label = f"Kërkim: {query} (Faqja {page_num})"
         else:
             if page_num > 1:
@@ -373,71 +580,90 @@ def list_movies(url: str, page: str, content_type: str, query: str = ''):
     else:
         category_label = f"Katalogu (Faqja {page_num})"
 
+    xbmc.log(f"[{ADDON_NAME}] list_movies starting: url='{url}', content_type='{content_type}', page={page_num}", level=xbmc.LOGINFO)
+
     xbmcplugin.setPluginCategory(HANDLE, category_label)
     xbmcplugin.setContent(HANDLE, 'tvshows' if content_type == 'series' else 'movies')
 
     session = get_http_session()
-    try:
-        response = session.get(url, timeout=get_timeout())
-        response.raise_for_status()
-        html_content = response.text
-    except requests.RequestException as exc:
-        xbmc.log(f"[{ADDON_NAME}] Connection error fetching {url}: {exc}", level=xbmc.LOGERROR)
-        xbmcgui.Dialog().notification(ADDON_NAME, "Gabim në lidhje me faqen", xbmcgui.NOTIFICATION_ERROR, 3500)
-        xbmcplugin.endOfDirectory(HANDLE, succeeded=False)
-        return
+    movie_cards = []
+    has_next_page = False
+    next_page_url = None
 
-    soup = BeautifulSoup(html_content, 'html.parser')
+    if content_type == 'search' and query:
+        safe_query = urllib.parse.quote_plus(query)
+        search_types = ['movie', 'seriale']
+        has_more_flag = False
 
-    # Multi-selector: inspect 'div.movie-thumb', 'article.item-movies', 'article.post', 'article'
-    movie_cards = soup.select('div.movie-thumb, article.item-movies, article.post, div.item-movies, article.item, div.poster, article')
-    seen_urls = set()
+        def _fetch_search_type(stype):
+            endpoint = f"{base_domain}/wp-zcore/discover.php?type={stype}&q={safe_query}&page={page_num}"
+            try:
+                r = session.get(endpoint, timeout=get_timeout(), headers={'X-Requested-With': 'XMLHttpRequest'})
+                if r.status_code == 200:
+                    return r.json()
+            except Exception as e:
+                xbmc.log(f"[{ADDON_NAME}] Search error for {stype}: {e}", level=xbmc.LOGWARNING)
+            return None
 
-    for card in movie_cards:
-        # Title and link extraction
-        link_elem = card.select_one('a.post-title, a.jt, h3 a, h2 a, .data h3 a, .data h2 a, .title a, a[title]')
-        if not link_elem:
-            link_elem = card.select_one('a')
-        if not link_elem:
-            continue
+        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as ex:
+            results = ex.map(_fetch_search_type, search_types)
+            for res_json in results:
+                if not res_json:
+                    continue
+                if res_json.get('hasMore'):
+                    has_more_flag = True
+                for it in res_json.get('items', []):
+                    rel_url = it.get('u', '')
+                    if not rel_url:
+                        continue
+                    full_u = urllib.parse.urljoin(base_domain, rel_url)
+                    movie_cards.append({
+                        'title': html.unescape(it.get('t', 'Pa Titull')),
+                        'url': full_u,
+                        'thumb': it.get('p', ''),
+                        'quality': it.get('q', ''),
+                        'rating': float(it['r']) if it.get('r') else None,
+                        'year': int(it['y']) if it.get('y') and str(it['y']).isdigit() else None,
+                        'plot': '',
+                        'genres': [it['g']] if it.get('g') else []
+                    })
 
-        raw_href = link_elem.get('href', '').strip()
-        if not raw_href or raw_href.startswith('#') or raw_href.startswith('javascript:'):
-            continue
+        has_next_page = has_more_flag
+        if has_next_page:
+            next_page_url = build_plugin_url({
+                'action': 'list_movies',
+                'content_type': 'search',
+                'query': query,
+                'page': str(page_num + 1)
+            })
+    else:
+        try:
+            xbmc.log(f"[{ADDON_NAME}] HTTP GET requesting: {url}", level=xbmc.LOGINFO)
+            response = session.get(url, timeout=get_timeout())
+            response.raise_for_status()
+            html_content = response.text
+            xbmc.log(f"[{ADDON_NAME}] HTTP GET received: {response.status_code}, length {len(html_content)} bytes", level=xbmc.LOGINFO)
+        except requests.RequestException as exc:
+            xbmc.log(f"[{ADDON_NAME}] Connection error fetching {url}: {exc}", level=xbmc.LOGERROR)
+            xbmcgui.Dialog().notification(ADDON_NAME, "Gabim në lidhje me faqen", xbmcgui.NOTIFICATION_ERROR, 3500)
+            xbmcplugin.endOfDirectory(HANDLE, succeeded=False)
+            return
 
-        item_page_url = urllib.parse.urljoin(url, raw_href)
-        if item_page_url in seen_urls:
-            continue
-        seen_urls.add(item_page_url)
+        movie_cards = extract_movie_cards(html_content, base_domain)
+        next_extracted = extract_next_page(html_content, page_num, base_domain)
+        if next_extracted:
+            has_next_page = True
+            next_page_url = next_extracted
 
-        # Movie title: check post-title heading or anchor title
-        title_h4 = card.select_one('a.post-title h4, h4, h3, h2, .data h3')
-        raw_title = title_h4.get_text(strip=True) if title_h4 else (link_elem.get('title') or link_elem.get_text(strip=True))
-        if not raw_title:
-            img_tag = card.select_one('img')
-            raw_title = img_tag.get('alt', '').strip() if img_tag else 'Pa Titull'
+    xbmc.log(f"[{ADDON_NAME}] Found {len(movie_cards)} cards on page", level=xbmc.LOGINFO)
 
-        # Quality badge extraction
-        quality_elem = card.select_one('.quality-poster, .quality, span.quality, .featu, .status, .hd, span.hd')
-        quality_badge = quality_elem.get_text(strip=True) if quality_elem else ''
+    for item in movie_cards:
+        raw_title = item['title']
+        item_page_url = item['url']
+        thumb_url = item['thumb']
+        quality_badge = item['quality']
         display_title = f"{raw_title} [{quality_badge}]" if quality_badge else raw_title
 
-        # Thumbnail extraction with lazy-load and srcset support
-        img_elem = card.select_one('img')
-        thumb_url = ''
-        if img_elem:
-            thumb_url = (
-                img_elem.get('src') or
-                img_elem.get('data-src') or
-                img_elem.get('data-lazy-src') or
-                img_elem.get('data-original') or ''
-            ).strip()
-            if not thumb_url and img_elem.get('srcset'):
-                thumb_url = img_elem['srcset'].split(',')[0].strip().split(' ')[0]
-            if thumb_url:
-                thumb_url = urllib.parse.urljoin(url, thumb_url)
-
-        # Build ListItem with video info metadata
         list_item = xbmcgui.ListItem(label=display_title)
         list_item.setArt({
             'icon': thumb_url or 'DefaultVideo.png',
@@ -445,55 +671,29 @@ def list_movies(url: str, page: str, content_type: str, query: str = ''):
             'poster': thumb_url or 'DefaultVideo.png'
         })
 
+        is_item_series = (content_type == 'series') or ('/seriale/' in item_page_url)
         info_dict = {
             'title': raw_title,
-            'mediatype': 'tvshow' if content_type == 'series' else 'movie'
+            'mediatype': 'tvshow' if is_item_series else 'movie'
         }
-
-        # Year extraction
-        year_elem = card.select_one('span.year, .data span, .metadata span, .year')
-        if year_elem:
-            year_val = year_elem.get_text(strip=True)
-            y_match = re.search(r'\b(19\d\d|20\d\d)\b', year_val)
-            if y_match:
-                info_dict['year'] = int(y_match.group(1))
-
-        # IMDb Rating extraction
-        rating_elem = card.select_one('.imdb-poster, .imdb, span.rating, .rating')
-        if rating_elem:
-            r_match = re.search(r'(\d+(?:\.\d+)?)', rating_elem.get_text(strip=True))
-            if r_match:
-                try:
-                    info_dict['rating'] = float(r_match.group(1))
-                except ValueError:
-                    pass
-
-        # Plot extraction
-        plot_elem = card.select_one('p.f-desc, .texto, .plot, p')
-        if plot_elem:
-            p_text = plot_elem.get_text(strip=True)
-            if p_text:
-                info_dict['plot'] = p_text
-
-        # Genre tags extraction
-        genres = []
-        for g in card.select('.block a, .m-card-genre, .genre a, .genres a'):
-            gt = g.get_text(strip=True)
-            if gt and gt not in genres:
-                genres.append(gt)
-        if genres:
-            info_dict['genres'] = genres
+        if item['year']:
+            info_dict['year'] = item['year']
+        if item['rating'] is not None:
+            info_dict['rating'] = item['rating']
+        if item['plot']:
+            info_dict['plot'] = item['plot']
+        if item['genres']:
+            info_dict['genres'] = item['genres']
 
         apply_video_metadata(list_item, info_dict)
 
-        # Context menu
         context_items = [
             ("Cilësimet e Shtojcës", f"RunPlugin({build_plugin_url({'action': 'open_settings'})})"),
             ("Rifresko", "Container.Refresh")
         ]
         list_item.addContextMenuItems(context_items)
 
-        if content_type == 'series':
+        if is_item_series:
             series_callback_url = build_plugin_url({
                 'action': 'list_episodes',
                 'url': item_page_url,
@@ -509,36 +709,27 @@ def list_movies(url: str, page: str, content_type: str, query: str = ''):
             })
             xbmcplugin.addDirectoryItem(handle=HANDLE, url=play_callback_url, listitem=list_item, isFolder=False)
 
-    # Pagination: Check for next page link
-    next_page_elem = soup.select_one('.wp-pagenavi a.nextpostslink, .pagination a.next, a.next, .nav-links a.next, a[rel="next"], .pagination-next a')
-    next_page_url = None
-
-    if next_page_elem and next_page_elem.get('href'):
-        next_page_url = urllib.parse.urljoin(url, next_page_elem['href'].strip())
-    else:
-        # Check numeric pagination links for page_num + 1
-        target_next_str = str(page_num + 1)
-        for num_link in soup.select('.pagination a, .nav-links a, .page-numbers a'):
-            if num_link.get_text(strip=True) == target_next_str and num_link.get('href'):
-                next_page_url = urllib.parse.urljoin(url, num_link['href'].strip())
-                break
-
-    if next_page_url:
+    if has_next_page and next_page_url:
         next_folder_item = xbmcgui.ListItem(label="Faqja Tjetër >>")
         next_folder_item.setArt({
             'icon': 'DefaultFolder.png',
             'thumb': 'DefaultFolder.png'
         })
-        next_callback_url = build_plugin_url({
-            'action': 'list_movies',
-            'url': next_page_url,
-            'page': str(page_num + 1),
-            'content_type': content_type,
-            'query': query
-        })
+        if content_type == 'search':
+            next_callback_url = next_page_url
+        else:
+            next_callback_url = build_plugin_url({
+                'action': 'list_movies',
+                'url': next_page_url,
+                'page': str(page_num + 1),
+                'content_type': content_type,
+                'query': query
+            })
         xbmcplugin.addDirectoryItem(handle=HANDLE, url=next_callback_url, listitem=next_folder_item, isFolder=True)
 
+    xbmc.log(f"[{ADDON_NAME}] Finished processing directory items. Calling endOfDirectory...", level=xbmc.LOGINFO)
     xbmcplugin.endOfDirectory(HANDLE)
+    release_memory()
 
 
 def list_episodes(series_url: str, series_thumb: str = '', series_title: str = ''):
@@ -560,22 +751,18 @@ def list_episodes(series_url: str, series_thumb: str = '', series_title: str = '
         xbmcplugin.endOfDirectory(HANDLE, succeeded=False)
         return
 
-    soup = BeautifulSoup(html_content, 'html.parser')
-
     # 1. Check if page contains Seasons (only if not already on a specific season page)
     season_links = []
     if '/sezoni-' not in series_url:
         seen_seasons = set()
-        for a in soup.find_all('a', href=True):
-            href = a['href']
-            if '/sezoni-' in href:
-                s_url = urllib.parse.urljoin(series_url, href)
-                if s_url not in seen_seasons:
-                    seen_seasons.add(s_url)
-                    s_title = a.get_text(strip=True)
-                    match = re.search(r'(Sezoni\s*\d+)', s_title, re.IGNORECASE)
-                    display_title = match.group(1) if match else (s_title or f"Sezoni {len(seen_seasons)}")
-                    season_links.append((display_title, s_url))
+        for m in re.finditer(r'''<a[^>]+href=[\"']([^\"']*/sezoni-[^\"']*)[\"'][^>]*>(.*?)</a>''', html_content, re.DOTALL | re.IGNORECASE):
+            s_url = urllib.parse.urljoin(series_url, m.group(1).strip())
+            if s_url not in seen_seasons:
+                seen_seasons.add(s_url)
+                s_raw = html.unescape(re.sub(r'<[^>]+>', ' ', m.group(2)).strip())
+                match = re.search(r'(Sezoni\s*\d+)', s_raw, re.IGNORECASE)
+                display_title = match.group(1) if match else (s_raw or f"Sezoni {len(seen_seasons)}")
+                season_links.append((display_title, s_url))
 
     if season_links:
         xbmcplugin.setPluginCategory(HANDLE, series_title or "Sezonet")
@@ -600,6 +787,7 @@ def list_episodes(series_url: str, series_thumb: str = '', series_title: str = '
             })
             xbmcplugin.addDirectoryItem(handle=HANDLE, url=call_url, listitem=list_item, isFolder=True)
         xbmcplugin.endOfDirectory(HANDLE)
+        release_memory()
         return
 
     # 2. Extract episodes (e.g. /seria/ links or DooPlay episode cards)
@@ -608,29 +796,25 @@ def list_episodes(series_url: str, series_thumb: str = '', series_title: str = '
 
     episode_links = []
     seen_episodes = set()
-    for a in soup.find_all('a', href=True):
-        href = a['href']
-        if '/seria/' in href:
-            ep_url = urllib.parse.urljoin(series_url, href)
-            if ep_url not in seen_episodes:
-                seen_episodes.add(ep_url)
-                ep_title = a.get_text(strip=True) or 'Episod'
-                if any(skip in ep_title.lower() for skip in ['fillo nga', 'episodi i fundit']):
-                    continue
-                episode_links.append((ep_title, ep_url))
+    for m in re.finditer(r'''<a[^>]+href=[\"']([^\"']*/seria/[^\"']+)[\"'][^>]*>(.*?)</a>''', html_content, re.DOTALL | re.IGNORECASE):
+        ep_url = urllib.parse.urljoin(series_url, m.group(1).strip())
+        if ep_url not in seen_episodes:
+            seen_episodes.add(ep_url)
+            ep_title = html.unescape(re.sub(r'<[^>]+>', ' ', m.group(2)).strip())
+            ep_title = ' '.join(ep_title.split())
+            if any(skip in ep_title.lower() for skip in ['fillo nga', 'episodi i fundit']):
+                continue
+            episode_links.append((ep_title or 'Episod', ep_url))
 
     # If standard DooPlay episode cards exist (#seasons .episodios li)
     if not episode_links:
-        for ep in soup.select('#seasons .episodios li, .episodios li, div.episodios li'):
-            link_elem = ep.select_one('.episodiotitle a, .imagen a, a')
-            if link_elem and link_elem.get('href'):
-                ep_url = urllib.parse.urljoin(series_url, link_elem['href'])
-                if ep_url not in seen_episodes:
-                    seen_episodes.add(ep_url)
-                    num_str = ep.select_one('.numerando').get_text(strip=True) if ep.select_one('.numerando') else ''
-                    title_str = ep.select_one('.episodiotitle a').get_text(strip=True) if ep.select_one('.episodiotitle a') else link_elem.get_text(strip=True)
-                    display_title = f"{num_str} - {title_str}" if num_str else (title_str or "Episod")
-                    episode_links.append((display_title, ep_url))
+        for ep_m in re.finditer(r'''<li[^>]*>.*?<div class=[\"']episodiotitle[\"']>.*?<a[^>]+href=[\"']([^\"']+)[\"'][^>]*>(.*?)</a>''', html_content, re.DOTALL | re.IGNORECASE):
+            ep_url = urllib.parse.urljoin(series_url, ep_m.group(1).strip())
+            if ep_url not in seen_episodes:
+                seen_episodes.add(ep_url)
+                ep_title = html.unescape(re.sub(r'<[^>]+>', ' ', ep_m.group(2)).strip())
+                ep_title = ' '.join(ep_title.split())
+                episode_links.append((ep_title or 'Episod', ep_url))
 
     if not episode_links:
         # Fallback to direct player check
@@ -736,7 +920,7 @@ def extract_server_name(embed_url: str) -> str:
         domain = domain_match.group(1).lower()
         if 'vidmoly' in domain:
             return 'Vidmoly'
-        if any(v in domain for v in ['voe', 'bysesukior', 'tuktukporn', 'yugua', 'audiar', 'reputationsdefend', 'generatormind', 'jilliangoor']):
+        if any(v in domain for v in ['voe', 'bysesukior', 'tuktukporn', 'yugua', 'audiar', 'reputationsdefend', 'generatormind', 'jilliangoor', 'eugenemakedraw']):
             return 'VOE'
         if 'streamtape' in domain or 'streamta' in domain:
             return 'Streamtape'
@@ -797,31 +981,30 @@ def extract_embed_sources(movie_url: str, html_content: str, session: requests.S
             'name': display_name
         })
 
-    soup = BeautifulSoup(html_content, 'html.parser')
-
     # Detect active server tab label if present
-    active_srv = soup.select_one('div.servers-list a.active, .servers-list li.active a, .server-item.active')
-    active_label = active_srv.get_text(strip=True) if active_srv else ''
+    active_m = re.search(r'''<(?:a|li)[^>]+class=[\"']([^\"']*(?:servers-list|server-item)[^\"']*active[^\"']*)[\"'][^>]*>(.*?)<''', html_content, re.IGNORECASE)
+    active_label = html.unescape(re.sub(r'<[^>]+>', '', active_m.group(2)).strip()) if (active_m and active_m.group(2)) else ''
 
-    # 1. Search player containers for iframe elements
-    containers = soup.select('#playex, div.source-box, div.play-box, div.movieplay, div.pframe, div.player, #mainPlayer')
-    if not containers:
-        containers = [soup]
-
-    for container in containers:
-        for iframe in container.select('iframe'):
-            iframe_src = (
-                iframe.get('src') or
-                iframe.get('data-src') or
-                iframe.get('data-lazy-src') or
-                iframe.get('data-url') or ''
-            )
-            if iframe_src:
-                add_source(iframe_src, active_label)
+    # 1. Search page markup for iframe elements
+    for ifr_m in re.finditer(r'''<iframe[^>]+(?:src|data-src|data-lazy-src|data-url)=[\"']([^\"']+)[\"']''', html_content, re.IGNORECASE):
+        add_source(ifr_m.group(1), active_label)
 
     # 2. Parallel scraping of non-active Server Tabs and DooPlay AJAX endpoints
-    servers_list = soup.select('div.servers-list a[href*="server="], ul.servers a[href*="server="]')
-    ajax_options = soup.select('li.dooplay_player_option, #playeroptionsul li')
+    servers_list = []
+    for tab_m in re.finditer(r'''<a[^>]+href=[\"']([^\"']*(?:server=|\?srv=)[^\"']*)[\"'][^>]*>(.*?)</a>''', html_content, re.IGNORECASE):
+        if 'active' not in tab_m.group(0):
+            srv_url = urllib.parse.urljoin(movie_url, tab_m.group(1).strip())
+            srv_label = html.unescape(re.sub(r'<[^>]+>', '', tab_m.group(2)).strip()) or 'Server'
+            servers_list.append((srv_url, srv_label))
+
+    ajax_options = []
+    for opt_m in re.finditer(r'''<li[^>]+class=[\"']([^\"']*dooplay_player_option[^\"']*)[\"'][^>]+data-post=[\"'](\d+)[\"'][^>]+data-nume=[\"'](\d+)[\"'][^>]+data-type=[\"']([^\"']+)[\"'][^>]*>(.*?)</li>''', html_content, re.IGNORECASE):
+        opt_post = opt_m.group(2)
+        opt_nume = opt_m.group(3)
+        opt_type = opt_m.group(4)
+        opt_label = html.unescape(re.sub(r'<[^>]+>', '', opt_m.group(5)).strip()) or f"Server {opt_nume}"
+        ajax_options.append((opt_post, opt_nume, opt_type, opt_label))
+
     base_domain = get_base_url()
     ajax_endpoint = f"{base_domain}/wp-admin/admin-ajax.php"
 
@@ -830,11 +1013,8 @@ def extract_embed_sources(movie_url: str, html_content: str, session: requests.S
         try:
             srv_resp = session.get(srv_url, timeout=get_timeout())
             if srv_resp.status_code == 200:
-                srv_soup = BeautifulSoup(srv_resp.text, 'html.parser')
-                for ifr in srv_soup.select('iframe'):
-                    i_src = ifr.get('src') or ifr.get('data-src') or ifr.get('data-lazy-src') or ''
-                    if i_src:
-                        results.append((i_src, srv_label))
+                for ifr_m in re.finditer(r'''<iframe[^>]+(?:src|data-src|data-lazy-src)=[\"']([^\"']+)[\"']''', srv_resp.text, re.IGNORECASE):
+                    results.append((ifr_m.group(1), srv_label))
         except Exception:
             pass
         return results
@@ -856,7 +1036,7 @@ def extract_embed_sources(movie_url: str, html_content: str, session: requests.S
             )
             if ajax_resp.status_code == 200:
                 resp_data = ajax_resp.text
-                for matched_iframe in re.findall(r'<iframe[^>]+src=["\']([^"\']+)["\']', resp_data, re.IGNORECASE):
+                for matched_iframe in re.findall(r'''<iframe[^>]+src=[\"']([^\"']+)[\"']''', resp_data, re.IGNORECASE):
                     results.append((matched_iframe, label))
                 host_regex_pattern = r'https?://(?:www\.)?(?:' + '|'.join(HOST_DOMAINS) + r')[^\s"\'<>]+'
                 for matched_url in re.findall(host_regex_pattern, resp_data, re.IGNORECASE):
@@ -867,21 +1047,11 @@ def extract_embed_sources(movie_url: str, html_content: str, session: requests.S
 
     tasks = []
     with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
-        for s_link in servers_list:
-            srv_href = s_link.get('href', '').strip()
-            srv_label = s_link.get_text(strip=True) or 'Server'
-            if srv_href and 'active' not in s_link.get('class', []):
-                srv_url = urllib.parse.urljoin(movie_url, srv_href)
-                tasks.append(executor.submit(_fetch_server_tab, srv_url, srv_label))
+        for srv_url, srv_label in servers_list:
+            tasks.append(executor.submit(_fetch_server_tab, srv_url, srv_label))
 
-        for opt in ajax_options:
-            post_id = opt.get('data-post')
-            nume = opt.get('data-nume')
-            ptype = opt.get('data-type', 'movie')
-            tab_title = opt.select_one('.title, .server, span')
-            label = tab_title.get_text(strip=True) if tab_title else f"Server {nume}"
-            if post_id and nume:
-                tasks.append(executor.submit(_fetch_ajax_player, post_id, nume, ptype, label))
+        for post_id, nume, ptype, label in ajax_options:
+            tasks.append(executor.submit(_fetch_ajax_player, post_id, nume, ptype, label))
 
         for future in concurrent.futures.as_completed(tasks):
             try:
@@ -1020,44 +1190,56 @@ def play(movie_url: str):
 
 def router():
     """URL query string dispatcher."""
-    raw_query = sys.argv[2][1:] if len(sys.argv) > 2 and sys.argv[2].startswith('?') else ''
-    parsed_params = urllib.parse.parse_qs(raw_query)
-    params = {k: v[0] if len(v) == 1 else v for k, v in parsed_params.items()}
+    xbmc.log(f"[{ADDON_NAME}] router dispatching: sys.argv={sys.argv}", level=xbmc.LOGINFO)
+    try:
+        raw_query = sys.argv[2][1:] if len(sys.argv) > 2 and sys.argv[2].startswith('?') else ''
+        parsed_params = urllib.parse.parse_qs(raw_query)
+        params = {k: v[0] if len(v) == 1 else v for k, v in parsed_params.items()}
 
-    action = params.get('action')
+        action = params.get('action')
 
-    if not action:
-        root_menu()
-    elif action == 'list_movies':
-        list_movies(
-            url=params.get('url', ''),
-            page=params.get('page', '1'),
-            content_type=params.get('content_type', 'movies'),
-            query=params.get('query', '')
-        )
-    elif action == 'list_episodes':
-        list_episodes(
-            series_url=params.get('url', ''),
-            series_thumb=params.get('thumb', ''),
-            series_title=params.get('title', '')
-        )
-    elif action == 'categories':
-        categories()
-    elif action == 'search_menu':
-        search_menu()
-    elif action == 'search_prompt' or action == 'search':
-        search_prompt()
-    elif action == 'remove_search_item':
-        remove_search_item(query=params.get('query', ''))
-    elif action == 'clear_search_history':
-        clear_search_history()
-    elif action == 'open_settings':
-        ADDON.openSettings()
-    elif action == 'play':
-        play(movie_url=params.get('url', ''))
-    else:
-        xbmc.log(f"[{ADDON_NAME}] Invalid action dispatched: {action}", level=xbmc.LOGWARNING)
-        xbmcplugin.endOfDirectory(HANDLE, succeeded=False)
+        if not action:
+            root_menu()
+        elif action == 'list_movies':
+            list_movies(
+                url=params.get('url', ''),
+                page=params.get('page', '1'),
+                content_type=params.get('content_type', 'movies'),
+                query=params.get('query', '')
+            )
+        elif action == 'list_episodes':
+            list_episodes(
+                series_url=params.get('url', ''),
+                series_thumb=params.get('thumb', ''),
+                series_title=params.get('title', '')
+            )
+        elif action == 'categories':
+            categories()
+        elif action == 'search_menu':
+            search_menu()
+        elif action == 'search_prompt' or action == 'search':
+            search_prompt()
+        elif action == 'remove_search_item':
+            remove_search_item(query=params.get('query', ''))
+        elif action == 'clear_search_history':
+            clear_search_history()
+        elif action == 'open_settings':
+            ADDON.openSettings()
+        elif action == 'play':
+            play(movie_url=params.get('url', ''))
+        else:
+            xbmc.log(f"[{ADDON_NAME}] Invalid action dispatched: {action}", level=xbmc.LOGWARNING)
+            xbmcplugin.endOfDirectory(HANDLE, succeeded=False)
+    except Exception as exc:
+        xbmc.log(f"[{ADDON_NAME}] Unhandled exception in router: {exc}", level=xbmc.LOGERROR)
+        import traceback
+        xbmc.log(traceback.format_exc(), level=xbmc.LOGERROR)
+        try:
+            xbmcplugin.endOfDirectory(HANDLE, succeeded=False)
+        except Exception:
+            pass
+    finally:
+        release_memory()
 
 
 if __name__ == '__main__':
